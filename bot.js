@@ -30,6 +30,7 @@ const FAUCET_BASE = (process.env.FAUCET_BASE_URL || "https://faucet.flop.network
 const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 30_000);
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 8_000);
 const OPEN_THRESHOLD_FLOP = 100;
+const GRANT_FLOP = 10;
 const OFFLINE_AFTER_FAILURES = 3;
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), "data");
 const SUBS_FILE = path.join(DATA_DIR, "subscribers.json");
@@ -164,6 +165,8 @@ function evaluate(health, limits) {
   const live = health.live !== false;
   const status = limits.faucet?.status ?? "unknown";
   const remainingFlop = Number(limits.faucet?.dailyCap?.remainingFlop ?? 0);
+  const pendingGrants = Number(limits.faucet?.pendingGrants ?? 0);
+  const effectiveFlop = remainingFlop - pendingGrants * GRANT_FLOP;
 
   if (!connected || !live) {
     return { category: "degraded", reason: "Faucet RPC is disconnected" };
@@ -180,7 +183,13 @@ function evaluate(health, limits) {
   if (remainingFlop < OPEN_THRESHOLD_FLOP) {
     return { category: "empty", reason: "Daily pool is used up" };
   }
-  return { category: "open", reason: "New pool is distributing" };
+  if (effectiveFlop < OPEN_THRESHOLD_FLOP) {
+    return {
+      category: "empty",
+      reason: "Global queue is ahead of the remaining pool (no capacity for new claims)",
+    };
+  }
+  return { category: "open", reason: "New pool has capacity and is distributing" };
 }
 
 function poolStats(limits) {
@@ -189,8 +198,10 @@ function poolStats(limits) {
   const limit = Number(cap.limitFlop ?? 0);
   const used = Number(cap.usedFlop ?? 0);
   const remaining = Number(cap.remainingFlop ?? 0);
+  const pending = Number(faucet.pendingGrants ?? 0);
+  const effective = remaining - pending * GRANT_FLOP;
   const percent = limit > 0 ? ((used / limit) * 100).toFixed(1) : "—";
-  return { faucet, cap, limit, used, remaining, percent };
+  return { faucet, cap, limit, used, remaining, percent, pending, effective };
 }
 
 function statusText(current) {
@@ -200,7 +211,7 @@ function statusText(current) {
 
   const health = current.health || {};
   const limits = current.limits || {};
-  const { faucet, limit, used, remaining, percent } = poolStats(limits);
+  const { faucet, limit, used, remaining, percent, pending, effective } = poolStats(limits);
   const dependencies = health.dependencies || {};
   const indexer = dependencies.indexer?.details || {};
   const signing = dependencies.signing || {};
@@ -225,7 +236,8 @@ function statusText(current) {
     "💧 <b>Pool</b>",
     `Remaining: <b>${fmtInt(remaining)}</b> / ${fmtInt(limit)} FLOP`,
     `Used: ${fmtInt(used)} FLOP (${percent}%)`,
-    `Global queue: <b>${fmtInt(faucet.pendingGrants ?? 0)}</b> grants`,
+    `Global queue: <b>${fmtInt(pending)}</b> grants`,
+    `New-claim capacity: <b>${fmtInt(Math.max(0, effective))}</b> FLOP ${effective < 0 ? "(queue ahead)" : ""}`,
     "",
     "🔐 <b>Signer & dependencies</b>",
     `Balance: ${fmtInt(balance)} FLOP · min ${fmtInt(minBalance)}`,
@@ -247,13 +259,14 @@ function statusText(current) {
 }
 
 function openText(current) {
-  const { limit, remaining } = poolStats(current.limits);
+  const { limit, remaining, pending, effective } = poolStats(current.limits);
   const reset = resetEstimate();
   return [
-    "🚰 <b>FLOP FAUCET OPEN</b> — new pool is distributing",
+    "🚰 <b>FLOP FAUCET OPEN</b> — new pool has capacity and is distributing",
     "",
     `💧 <b>${fmtInt(remaining)}</b> FLOP left / ${fmtInt(limit)}`,
-    `🧾 Global queue: <b>${fmtInt(current.limits.faucet?.pendingGrants ?? 0)}</b> grants`,
+    `🧾 Global queue: <b>${fmtInt(pending)}</b> grants`,
+    `⚡ New-claim capacity: <b>${fmtInt(Math.max(0, effective))}</b> FLOP`,
     `🔐 Signer ${current.health?.dependencies?.signer?.ok ? "✅" : "❌"} · Indexer ${current.health?.dependencies?.indexer?.ok ? "✅" : "❌"} · RPC ${current.health?.connected ? "✅" : "❌"}`,
     "",
     "⚡ Claim now: https://faucet.flop.network",
@@ -262,17 +275,18 @@ function openText(current) {
 }
 
 function emptyText(current) {
-  const { limit, used } = poolStats(current.limits);
+  const { limit, used, pending, effective } = poolStats(current.limits);
   const reset = resetEstimate();
   return [
     "⛔ <b>FLOP FAUCET EMPTY</b> — distribution stopped",
     "",
     `Reason: <i>${escapeHtml(current.reason || "pool used up")}</i>`,
     `Used: ${fmtInt(used)} / ${fmtInt(limit)} FLOP`,
-    `Global queue: <b>${fmtInt(current.limits.faucet?.pendingGrants ?? 0)}</b> grants`,
+    `Global queue: <b>${fmtInt(pending)}</b> grants`,
+    `New-claim capacity: <b>${fmtInt(Math.max(0, effective))}</b> FLOP ${effective < 0 ? "(queue ahead)" : ""}`,
     `♻️ Next reset (est.): in ${reset.in} · ${reset.utc}`,
     "",
-    "I’ll ping you the moment a new pool opens.",
+    "I’ll ping you the moment a new pool has capacity.",
   ].join("\n");
 }
 
